@@ -181,6 +181,28 @@ async def _segment_answers(client, evidence: dict) -> bool:
     if not segment:
         return False
     segment_url = urljoin(variant_url, segment)
+
+    def _tag_uris(tag: str) -> list:
+        pattern = r"#EXT-X-" + tag + r":[^\n]*URI=\"([^\"]+)\""
+        return list(dict.fromkeys(urljoin(variant_url, match.group(1))
+                                  for match in re.finditer(pattern, variant)))
+
+    # An AES-128 segment starts with 16 random-looking bytes: only the key
+    # tells whether it is a real segment or garbage with a video content type.
+    for key_url in (u for u in _tag_uris(r"(?:SESSION-)?KEY") if u.startswith("http")):
+        try:
+            res = await client.get(key_url, headers=headers)
+            if res.status_code != 200 or len(res.content) < 16:
+                return False
+        except Exception:
+            return False
+    for map_url in (u for u in _tag_uris("MAP") if u.startswith("http")):
+        try:
+            res = await client.get(map_url, headers=headers)
+            if res.status_code != 200 or len(res.content) < 16:
+                return False
+        except Exception:
+            return False
     try:
         res = await client.get(
             segment_url, headers={**headers, "Range": "bytes=0-2047"})
