@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import re
 import time
+from urllib.parse import urljoin
 
 import httpx
 
@@ -25,6 +26,7 @@ WATCH_CACHE_TTL = 45.0
 QUALITY_GRACE = 2.0
 QUALITY_TIMEOUT = 4.0
 QUALITY_STREAMS = 4
+QUALITY_VERIFY = 5
 QUALITY_DRAIN = 2.0
 
 _latency: dict = {}
@@ -96,34 +98,107 @@ def _hls_streams(streams: list) -> list:
             and str(s.get("type") or "hls").lower() == "hls"]
 
 
-async def _playlist_height(client, stream: dict) -> int:
-    url = stream.get("url")
-    if not isinstance(url, str) or not url.startswith("http"):
-        return 0
+def _unique_hls(streams: list, limit: int | None = None) -> list:
+    seen, out = set(), []
+    for stream in _hls_streams(streams):
+        url = stream.get("url")
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(stream)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def _stream_headers(stream: dict) -> dict:
     headers = {"User-Agent": UA, "Accept": "*/*"}
     referer = stream.get("referer")
     if referer:
         headers["Referer"] = referer
+    return headers
+
+
+async def _probe_master(client, stream: dict) -> dict | None:
+    url = stream.get("url")
+    if not isinstance(url, str) or not url.startswith("http"):
+        return None
     try:
-        res = await client.get(url, headers=headers)
+        res = await client.get(url, headers=_stream_headers(stream))
         if res.status_code != 200:
-            return 0
+            return None
         text = res.text
     except Exception:
-        return 0
+        return None
     if "#EXTM3U" not in text:
-        return 0
+        return None
     heights = [int(h) for h in re.findall(r"RESOLUTION=\d+x(\d+)", text)]
-    return max(heights) if heights else 0
+    return {
+        "url": url,
+        "text": text,
+        "referer": stream.get("referer"),
+        "height": max(heights) if heights else 0,
+    }
 
 
-async def _quality_height(streams: list) -> int:
-    probes = _hls_streams(streams)[:QUALITY_STREAMS]
+async def _quality_evidence(streams: list) -> dict | None:
+    probes = _unique_hls(streams, QUALITY_STREAMS)
     if not probes:
-        return 0
+        return None
     async with httpx.AsyncClient(timeout=QUALITY_TIMEOUT, follow_redirects=True) as client:
-        heights = await asyncio.gather(*[_playlist_height(client, s) for s in probes])
-    return max(heights) if heights else 0
+        found = await asyncio.gather(*[_probe_master(client, s) for s in probes])
+    usable = [item for item in found if item]
+    return max(usable, key=lambda item: item["height"]) if usable else None
+
+
+def _best_variant(evidence: dict) -> str | None:
+    if not evidence or not evidence.get("height"):
+        return None
+    pattern = (r"RESOLUTION=\d+x" + str(evidence["height"])
+               + r"[^\n]*\n\s*([^\s#][^\n]*)")
+    match = re.search(pattern, evidence["text"])
+    if not match:
+        return None
+    return urljoin(evidence["url"], match.group(1).strip())
+
+
+async def _segment_answers(client, evidence: dict) -> bool:
+    variant_url = _best_variant(evidence)
+    if not variant_url:
+        return False
+    headers = {"User-Agent": UA, "Accept": "*/*"}
+    if evidence.get("referer"):
+        headers["Referer"] = evidence["referer"]
+    try:
+        res = await client.get(variant_url, headers=headers)
+        if res.status_code != 200 or "#EXTM3U" not in res.text:
+            return False
+        variant = res.text
+    except Exception:
+        return False
+    segment = next((line.strip() for line in variant.splitlines()
+                    if line.strip() and not line.strip().startswith("#")), None)
+    if not segment:
+        return False
+    segment_url = urljoin(variant_url, segment)
+    try:
+        res = await client.get(
+            segment_url, headers={**headers, "Range": "bytes=0-2047"})
+        if res.status_code not in (200, 206):
+            return False
+        body = res.content[:2048]
+        content_type = (res.headers.get("content-type") or "").lower()
+    except Exception:
+        return False
+    start = body.lstrip().lower()
+    if start.startswith(b"<!doctype") or b"<html" in start[:200]:
+        return False
+    if body.startswith(b"\x47") or b"ftyp" in body[:64]:
+        return True
+    if body.startswith(b"\xff\xd8\xff") or body.startswith(b"\x89PNG"):
+        return False
+    return len(body) >= 2048 and (
+        content_type.startswith("video/") or "octet-stream" in content_type)
 
 
 def _candidate(name, streams, seconds):
@@ -196,15 +271,30 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
                     task.cancel()
     if not candidates:
         return None
-    heights = await asyncio.gather(*[_quality_height(c["streams"]) for c in candidates])
-    for candidate, height in zip(candidates, heights):
-        candidate["height"] = height
+    evidence = await asyncio.gather(*[_quality_evidence(c["streams"]) for c in candidates])
+    for candidate, item in zip(candidates, evidence):
+        candidate["evidence"] = item
+        candidate["height"] = item["height"] if item else 0
     candidates.sort(
-        key=lambda c: (c["height"], len(_hls_streams(c["streams"])),
+        key=lambda c: (c["height"], len(_unique_hls(c["streams"])),
                        -c["rank"], -c["seconds"]),
         reverse=True,
     )
-    best = candidates[0]
+    # A master playlist that announces 1080p proves nothing: several providers
+    # answer it with a segment that is an HTML error page. Play the first
+    # segment of the best variant before believing the resolution.
+    best = None
+    top = [c for c in candidates[:QUALITY_VERIFY] if c["height"] > 0]
+    if top:
+        async with httpx.AsyncClient(timeout=QUALITY_TIMEOUT, follow_redirects=True) as client:
+            answers = await asyncio.gather(
+                *[_segment_answers(client, c["evidence"]) for c in top])
+        for candidate, answers_ok in zip(top, answers):
+            if answers_ok:
+                best = candidate
+                break
+    if best is None:
+        best = candidates[0]
     winner = {"provider": best["provider"], "streams": best["streams"]}
     winner["timings"] = timings
     winner["defaultProvider"] = default_provider()
