@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from src.endpoints import router
 from src.config import HEADERS
 import httpx
+import json
 import os
 
 app = FastAPI(title="Kuhi API", version="2.0")
@@ -51,6 +52,18 @@ async def proxy_m3u8(url: str, referer: str):
         h = HEADERS.copy()
         h["Referer"] = referer
         resp = await client.get(url, headers=h)
+
+        # The provider refused (403, 404), or answered something that is not a
+        # playlist. Returning it as a playlist would give the caller a 200
+        # with garbage: the player would try to read it, fail, and the
+        # application would not know the stream was dead. The status of the
+        # upstream is the status of the answer.
+        if resp.status_code != 200 or not resp.text.strip().startswith("#EXTM3U"):
+            return Response(
+                content=json.dumps({"detail": "playlist refused by the provider",
+                                     "upstream_status": resp.status_code}),
+                status_code=502 if resp.status_code >= 500 else 404,
+                media_type="application/json")
 
         content = resp.text
         lines = []
