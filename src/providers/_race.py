@@ -28,6 +28,7 @@ QUALITY_TIMEOUT = 4.0
 QUALITY_STREAMS = 4
 QUALITY_VERIFY = 5
 QUALITY_DRAIN = 2.0
+SEGMENT_TIMEOUT = 8.0
 
 _latency: dict = {}
 _ep_latency: dict = {}
@@ -164,18 +165,26 @@ def _best_variant(evidence: dict) -> str | None:
 
 async def _segment_answers(client, evidence: dict) -> bool:
     variant_url = _best_variant(evidence)
-    if not variant_url:
-        return False
     headers = {"User-Agent": UA, "Accept": "*/*"}
     if evidence.get("referer"):
         headers["Referer"] = evidence["referer"]
-    try:
-        res = await client.get(variant_url, headers=headers)
-        if res.status_code != 200 or "#EXTM3U" not in res.text:
+    if variant_url:
+        try:
+            res = await client.get(variant_url, headers=headers)
+            if res.status_code != 200 or "#EXTM3U" not in res.text:
+                return False
+            variant = res.text
+        except Exception:
             return False
-        variant = res.text
-    except Exception:
-        return False
+    else:
+        # A provider that answers a media playlist, not a master: the first
+        # segment is in that playlist already.
+        if evidence.get("height"):
+            return False
+        variant_url = evidence.get("url")
+        variant = evidence.get("text") or ""
+        if not variant_url or "#EXTM3U" not in variant:
+            return False
     segment = next((line.strip() for line in variant.splitlines()
                     if line.strip() and not line.strip().startswith("#")), None)
     if not segment:
@@ -204,12 +213,18 @@ async def _segment_answers(client, evidence: dict) -> bool:
         except Exception:
             return False
     try:
-        res = await client.get(
-            segment_url, headers={**headers, "Range": "bytes=0-2047"})
-        if res.status_code not in (200, 206):
-            return False
-        body = res.content[:2048]
-        content_type = (res.headers.get("content-type") or "").lower()
+        async with client.stream(
+            "GET", segment_url, headers={**headers, "Range": "bytes=0-2047"}
+        ) as res:
+            if res.status_code not in (200, 206):
+                return False
+            content_type = (res.headers.get("content-type") or "").lower()
+            body = bytearray()
+            async for chunk in res.aiter_bytes():
+                body.extend(chunk)
+                if len(body) >= 2048:
+                    break
+            body = bytes(body[:2048])
     except Exception:
         return False
     start = body.lstrip().lower()
@@ -306,9 +321,9 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
     # answer it with a segment that is an HTML error page. Play the first
     # segment of the best variant before believing the resolution.
     best = None
-    top = [c for c in candidates[:QUALITY_VERIFY] if c["height"] > 0]
+    top = [c for c in candidates if c.get("evidence")][:QUALITY_VERIFY]
     if top:
-        async with httpx.AsyncClient(timeout=QUALITY_TIMEOUT, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=SEGMENT_TIMEOUT, follow_redirects=True) as client:
             answers = await asyncio.gather(
                 *[_segment_answers(client, c["evidence"]) for c in top])
         for candidate, answers_ok in zip(top, answers):
