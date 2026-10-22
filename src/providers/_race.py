@@ -1,7 +1,11 @@
 import asyncio
 import importlib
+import re
 import time
 
+import httpx
+
+from src.providers._http import UA
 from src.providers._media import build_ctx
 
 RANKING = [
@@ -12,6 +16,14 @@ RANKING = [
 WATCH_TIMEOUT = 75.0
 EPISODES_TIMEOUT = 60.0
 WATCH_CACHE_TTL = 45.0
+
+# The first provider to answer is the fastest, not the best: a provider that
+# only mirrors a 480p playlist can beat the one holding the 1080p variants.
+# Wait a short grace period, then weigh the candidates on the resolution
+# advertised by their playlists.
+QUALITY_GRACE = 2.0
+QUALITY_TIMEOUT = 4.0
+QUALITY_STREAMS = 4
 
 _latency: dict = {}
 _ep_latency: dict = {}
@@ -76,6 +88,51 @@ async def _watch_one(mod, name, anilist_id, ep, audio, ctx):
         return name, None, round(time.time() - t0, 3), False
 
 
+def _hls_streams(streams: list) -> list:
+    return [s for s in streams
+            if isinstance(s, dict) and s.get("url")
+            and str(s.get("type") or "hls").lower() == "hls"]
+
+
+async def _playlist_height(client, stream: dict) -> int:
+    url = stream.get("url")
+    if not isinstance(url, str) or not url.startswith("http"):
+        return 0
+    headers = {"User-Agent": UA, "Accept": "*/*"}
+    referer = stream.get("referer")
+    if referer:
+        headers["Referer"] = referer
+    try:
+        res = await client.get(url, headers=headers)
+        if res.status_code != 200:
+            return 0
+        text = res.text
+    except Exception:
+        return 0
+    if "#EXTM3U" not in text:
+        return 0
+    heights = [int(h) for h in re.findall(r"RESOLUTION=\d+x(\d+)", text)]
+    return max(heights) if heights else 0
+
+
+async def _quality_height(streams: list) -> int:
+    probes = _hls_streams(streams)[:QUALITY_STREAMS]
+    if not probes:
+        return 0
+    async with httpx.AsyncClient(timeout=QUALITY_TIMEOUT, follow_redirects=True) as client:
+        heights = await asyncio.gather(*[_playlist_height(client, s) for s in probes])
+    return max(heights) if heights else 0
+
+
+def _candidate(name, streams, seconds):
+    return {
+        "provider": name,
+        "streams": streams,
+        "seconds": seconds,
+        "rank": RANKING.index(name) if name in RANKING else len(RANKING),
+    }
+
+
 async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
                      preferred: str | None = None) -> dict | None:
     mods = providers()
@@ -98,18 +155,25 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
     pending = {asyncio.ensure_future(_watch_one(mod, name, anilist_id, ep, audio, ctx))
                for name, mod in mods}
     timings: dict = {}
-    winner = None
+    candidates: list[dict] = []
+    first_at = None
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            timeout = None
+            if first_at is not None:
+                timeout = QUALITY_GRACE - (time.time() - first_at)
+                if timeout <= 0:
+                    break
+            done, pending = await asyncio.wait(
+                pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 name, streams, dt, ok = task.result()
                 timings[name] = {"seconds": dt, "ok": ok}
                 record_latency(name, dt, ok)
-                if ok and winner is None:
-                    winner = {"provider": name, "streams": streams}
-            if winner is not None:
-                break
+                if ok:
+                    if first_at is None:
+                        first_at = time.time()
+                    candidates.append(_candidate(name, streams, dt))
     finally:
 
         if pending:
@@ -120,14 +184,26 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
                         name, streams, dt, ok = task.result()
                         timings[name] = {"seconds": dt, "ok": ok}
                         record_latency(name, dt, ok)
+                        if ok:
+                            candidates.append(_candidate(name, streams, dt))
                     except Exception:
                         pass
                 pending = pending2
             finally:
                 for task in pending:
                     task.cancel()
-    if winner is None:
+    if not candidates:
         return None
+    heights = await asyncio.gather(*[_quality_height(c["streams"]) for c in candidates])
+    for candidate, height in zip(candidates, heights):
+        candidate["height"] = height
+    candidates.sort(
+        key=lambda c: (c["height"], len(_hls_streams(c["streams"])),
+                       -c["rank"], -c["seconds"]),
+        reverse=True,
+    )
+    best = candidates[0]
+    winner = {"provider": best["provider"], "streams": best["streams"]}
     winner["timings"] = timings
     winner["defaultProvider"] = default_provider()
     if preferred:
