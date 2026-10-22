@@ -43,13 +43,35 @@ async def get_media(anilist_id: int) -> dict:
         arm, data = await asyncio.gather(
             _fetch_arm(anilist_id),
             anilist_query(MEDIA_QUERY, {"id": int(anilist_id)}),
+            # One failure does not cancel the other: the ARM mapping and the
+            # AniList are two different services, and either can refuse.
+            return_exceptions=True,
         )
     except Exception as e:
         raise RuntimeError(f"No data found for AniList ID {anilist_id}: {e}")
-    al = (data or {}).get("Media")
+    arm = arm if isinstance(arm, dict) else {}
+    al = (data or {}).get("Media") if isinstance(data, dict) else None
     if not al:
-        raise RuntimeError(f"No data found for AniList ID {anilist_id}")
-    arm = arm or {}
+        # AniList is not answering, and the whole API was down on 21 October
+        # 2026. It is not needed: the providers get their titles from the
+        # AniZip (`build_titles`), and the ARM mapping gives the MyAnimeList
+        # id. What is lost is the episode count and the airing status, which
+        # the providers treat as "unknown" anyway.
+        media = {
+            "id": int(anilist_id),
+            "idMal": arm.get("myanimelist"),
+            "title": {},
+            "status": "RELEASING",
+            "format": None,
+            "episodes": None,
+            "seasonYear": None,
+            "startDate": None,
+            "nextAiringEpisode": None,
+            "synonyms": [],
+            "arm": arm,
+        }
+        _cache.set(key, media, _cache.MAPPING_TTL)
+        return media
     media = {
         "id": int(anilist_id),
         "idMal": arm.get("myanimelist") or al.get("idMal"),

@@ -541,12 +541,19 @@ async def extract_simple(
             }
         }
         """
-        media_data = await anilist_query(gql, {"id": anilist_id})
-        media = media_data.get("Media")
-        if not media:
-            raise HTTPException(status_code=404, detail="anime not found")
+        media_data = None
+        try:
+            media_data = await anilist_query(gql, {"id": anilist_id})
+        except Exception:
+            # AniList is not always answering: it limits the requests per
+            # address, and it disabled its whole API on 21 October 2026. The
+            # format is only used to tell a film (one "episode") from a
+            # series -- and a series does not need it at all. Asking the
+            # providers is the work that matters.
+            media_data = None
+        media = media_data.get("Media") if media_data else None
 
-        if media.get("format") == "MOVIE":
+        if media and media.get("format") == "MOVIE":
             episode = 1
     else:
 
@@ -560,7 +567,10 @@ async def extract_simple(
             }}
         }}
         """
-        search_data = await anilist_query(gql, {"search": query.replace("-", " ")})
+        try:
+            search_data = await anilist_query(gql, {"search": query.replace("-", " ")})
+        except Exception:
+            raise HTTPException(status_code=404, detail="anime not found")
         media_list = search_data.get("Page", {}).get("media", [])
         if not media_list:
             raise HTTPException(status_code=404, detail="anime not found")

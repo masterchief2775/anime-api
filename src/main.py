@@ -22,6 +22,12 @@ if os.path.exists("assets"):
 
 app.include_router(router, prefix="/anime")
 
+# The subtitle files, converted to WebVTT: a <track> element reads that, and
+# nothing else.
+from src.subtitles import router as subtitles_router
+
+app.include_router(subtitles_router, prefix="/anime")
+
 from fastapi import Query
 from fastapi.responses import Response
 
