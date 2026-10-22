@@ -20,10 +20,12 @@ WATCH_CACHE_TTL = 45.0
 # The first provider to answer is the fastest, not the best: a provider that
 # only mirrors a 480p playlist can beat the one holding the 1080p variants.
 # Wait a short grace period, then weigh the candidates on the resolution
-# advertised by their playlists.
+# advertised by their playlists. The providers that answer after that window
+# are not worth another eight seconds: the caller is already waiting.
 QUALITY_GRACE = 2.0
 QUALITY_TIMEOUT = 4.0
 QUALITY_STREAMS = 4
+QUALITY_DRAIN = 2.0
 
 _latency: dict = {}
 _ep_latency: dict = {}
@@ -178,7 +180,7 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
 
         if pending:
             try:
-                done2, pending2 = await asyncio.wait(pending, timeout=8.0)
+                done2, pending2 = await asyncio.wait(pending, timeout=QUALITY_DRAIN)
                 for task in done2:
                     try:
                         name, streams, dt, ok = task.result()
