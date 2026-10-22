@@ -7,6 +7,15 @@ from src.config import HEADERS
 import httpx
 import json
 import os
+import re
+
+
+def _proxy_url(absolute_url: str, referer: str) -> str:
+    from urllib.parse import quote
+
+    if ".m3u8" in absolute_url:
+        return f"/proxy_m3u8?url={quote(absolute_url, safe='')}&referer={quote(referer, safe='')}"
+    return f"/proxy_segment?url={quote(absolute_url, safe='')}&referer={quote(referer, safe='')}"
 
 app = FastAPI(title="Kuhi API", version="2.0")
 
@@ -66,16 +75,23 @@ async def proxy_m3u8(url: str, referer: str):
                 media_type="application/json")
 
         content = resp.text
+        from urllib.parse import urljoin
+
         lines = []
-        from urllib.parse import quote, urljoin
         for line in content.split('\n'):
             stripped = line.strip()
             if stripped and not stripped.startswith('#'):
                 absolute_url = urljoin(url, stripped)
-                if '.m3u8' in stripped:
-                    line = f"/proxy_m3u8?url={quote(absolute_url, safe='')}&referer={quote(referer, safe='')}"
-                else:
-                    line = f"/proxy_segment?url={quote(absolute_url, safe='')}&referer={quote(referer, safe='')}"
+                line = _proxy_url(absolute_url, referer)
+            else:
+                # The tags carry relative addresses too -- the audio tracks of
+                # an #EXT-X-MEDIA, the keys of an #EXT-X-KEY. Left alone they
+                # resolve against the proxy, and the audio never loads.
+                line = re.sub(
+                    r'URI="([^"]+)"',
+                    lambda m: 'URI="' + _proxy_url(urljoin(url, m.group(1)), referer) + '"',
+                    line,
+                )
             lines.append(line)
 
         return Response(content='\n'.join(lines), media_type="application/vnd.apple.mpegurl")
